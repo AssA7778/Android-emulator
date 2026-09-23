@@ -2,8 +2,8 @@
 # نصب کامل android-farm روی Ubuntu 22.04/24.04 (x86_64)
 #   sudo bash install.sh                 نصب کامل
 #   sudo bash install.sh --check         فقط بررسی پیش‌نیازها، بدون نصب
-#   sudo bash install.sh --domain d.com  نمایشگر وب با HTTPS روی دامنه
-#   sudo bash install.sh --no-web        بدون نمایشگر وب
+#   sudo bash install.sh --domain d.com  پنل وب با HTTPS روی دامنه
+#   sudo bash install.sh --no-web        بدون پنل وب و نمایشگر صفحه
 #   sudo bash install.sh --no-gapps      اندروید ۱۳ خام، بدون Google Play
 set -euo pipefail
 
@@ -133,6 +133,8 @@ install_app() {
   chmod 700 "$DATA_DIR"
   install -m 755 "$SRC_DIR/droid" "$APP_DIR/droid"
   install -m 644 "$SRC_DIR/lib/identity.py" "$APP_DIR/lib/identity.py"
+  install -m 644 "$SRC_DIR/lib/panel.py" "$APP_DIR/lib/panel.py"
+  install -D -m 644 "$SRC_DIR/web/index.html" "$APP_DIR/web/index.html"
   ln -sf "$APP_DIR/droid" /usr/local/bin/droid
 
   cat > /etc/systemd/system/android-farm-reconnect.service <<EOF
@@ -181,7 +183,7 @@ build_gapps_image() {
 }
 
 install_web() {
-  step "نمایشگر وب (ws-scrcpy پشت Caddy با رمز)"
+  step "پنل وب + نمایشگر صفحه (ws-scrcpy) پشت Caddy با رمز"
   if ! command -v node >/dev/null || (( $(node -v | tr -dc 0-9. | cut -d. -f1) < 18 )); then
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
     apt-get install -y -qq nodejs build-essential >/dev/null
@@ -212,6 +214,21 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
+  # پنل مدیریت (پروفایل، گوشی، بکاپ)؛ خودش فقط روی 127.0.0.1 گوش می‌دهد
+  cat > /etc/systemd/system/android-farm-panel.service <<EOF
+[Unit]
+Description=android-farm web panel
+After=docker.service
+Wants=docker.service
+
+[Service]
+ExecStart=/usr/bin/python3 $APP_DIR/lib/panel.py --host 127.0.0.1 --port 8100
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
   if ! command -v caddy >/dev/null; then
     apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg >/dev/null
     curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -219,31 +236,45 @@ EOF
     apt-get update -qq && apt-get install -y -qq caddy >/dev/null
   fi
 
-  local pass hash site url ip
+  local pass hash site url screen ip
   pass=$(python3 -c 'import secrets; print(secrets.token_urlsafe(15))')
   hash=$(caddy hash-password --plaintext "$pass")
   ip=$(curl -fsS4 --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')
   local tls_line=""
-  if [[ -n $DOMAIN ]]; then site="$DOMAIN"; url="https://$DOMAIN"
-  else site="https://$ip:8443"; url="https://$ip:8443"; tls_line="	tls internal"; fi
+  # پنل روی آدرس اصلی، صفحه‌ی گوشی‌ها روی پورت 8444 (ws-scrcpy زیر مسیر فرعی کار نمی‌کند)
+  if [[ -n $DOMAIN ]]; then site="$DOMAIN"; url="https://$DOMAIN"; screen="https://$DOMAIN:8444"
+  else site="https://$ip:8443"; url="https://$ip:8443"; screen="https://$ip:8444"; tls_line="	tls internal"; fi
 
   cat > /etc/caddy/Caddyfile <<EOF
-$site {
+(farm) {
 $tls_line
 	basic_auth {
 		admin $hash
 	}
+}
+
+$site {
+	import farm
+	reverse_proxy 127.0.0.1:8100
+}
+
+$screen {
+	import farm
 	reverse_proxy 127.0.0.1:8000
 }
 EOF
   echo "$url" > "$CONF_DIR/web-url"
-  printf 'user: admin\npass: %s\nurl:  %s\n' "$pass" "$url" > "$CONF_DIR/web-credentials"
+  echo "$screen" > "$CONF_DIR/screen-url"
+  printf 'user: admin\npass: %s\npanel:  %s\nscreen: %s\n' "$pass" "$url" "$screen" > "$CONF_DIR/web-credentials"
   chmod 600 "$CONF_DIR/web-credentials"
 
   systemctl daemon-reload
   systemctl enable --now ws-scrcpy >/dev/null
+  systemctl enable android-farm-panel >/dev/null
+  systemctl restart android-farm-panel
   systemctl restart caddy
-  ok "نمایشگر وب: $url  (user: admin — رمز در $CONF_DIR/web-credentials)"
+  ok "پنل وب: $url  (user: admin — رمز در $CONF_DIR/web-credentials)"
+  ok "صفحه‌ی گوشی‌ها: $screen  (از پنل با «باز کردن صفحه» هم باز می‌شود)"
   if [[ -z $DOMAIN ]]; then warn "بدون دامنه، گواهی self-signed است؛ مرورگر یک هشدار می‌دهد که باید قبولش کنی"; fi
 }
 
@@ -275,4 +306,6 @@ cat <<'EOF'
   droid view acc1                راه دیدن صفحه
   droid models                   مدل‌های قابل انتخاب
   droid gsf acc1                 شناسه‌ی ثبت در گوگل (اگر Play گفت «دستگاه تأییدنشده»)
+  droid backup acc1              بکاپ کامل (هویت + داده‌ها)
+  droid restore file.tar.gz      بازگردانی از بکاپ
 EOF

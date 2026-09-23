@@ -6,6 +6,7 @@
   droid list | info <name> | start <name> | stop <name> | rm <name> [--purge]
   droid shell <name> | view <name> | proxy <name> <host:port|off>
   droid gsf <name> | models | reconnect
+  droid backup <name> [-o file.tar.gz] | restore <file> [--name N]
 """
 import argparse
 import json
@@ -298,7 +299,7 @@ def cmd_view(a):
     if cfg.exists():
         web = cfg.read_text().strip()
     if web:
-        print(f"وب: {web}  ← دستگاه {serial(prof)} را از لیست انتخاب کن")
+        print(f"پنل وب: {web}  ← روی کارت «{prof['name']}» دکمه‌ی «باز کردن صفحه»")
     print("روی کامپیوتر خودت (با scrcpy نصب‌شده):")
     print(f"  ssh -N -L {prof['port']}:127.0.0.1:{prof['port']} root@<server-ip> &")
     print(f"  adb connect 127.0.0.1:{prof['port']} && scrcpy -s 127.0.0.1:{prof['port']}")
@@ -394,6 +395,120 @@ def cmd_profile(a):
             print(f"✓ پروفایل «{a.pname}» پاک شد")
 
 
+def backups_dir() -> Path:
+    return HOME / ".backups"
+
+
+BACKUP_MARK = "android-farm-backup"
+
+
+def cmd_backup(a):
+    prof = load(a.name)
+    out = Path(a.output) if a.output else backups_dir() / f"{a.name}-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    was_running = status(a.name) == "running"
+    # کپی /data وقتی اندروید روشن است دیتابیس‌ها را نیمه‌کاره برمی‌دارد؛ پس چند لحظه خاموش می‌شود
+    if was_running:
+        print(f"… «{a.name}» برای بکاپ سالم موقتاً خاموش می‌شود")
+        run(["adb", "disconnect", serial(prof)], check=False, capture=True)
+        run(["docker", "stop", "-t", "20", container(a.name)], check=False, capture=True)
+    (HOME / a.name / BACKUP_MARK).write_text("1\n")
+    tmp = out.with_name(out.name + ".part")
+    try:
+        # مالک عددی و مجوزها باید دقیق بمانند، وگرنه اندروید اپ‌ها را بعد از بازگردانی باز نمی‌کند
+        r = run(["tar", "-C", str(HOME / a.name), "--numeric-owner", "--xattrs", "--xattrs-include=*",
+                 "-czpf", str(tmp), BACKUP_MARK, "profile.json", "data"], check=False, capture=True)
+        if r.returncode not in (0, 1):  # 1 = فایلی حین خواندن عوض شد، که بعد از خاموشی رخ نمی‌دهد
+            tmp.unlink(missing_ok=True)
+            die(f"ساخت بکاپ شکست خورد:\n{r.stderr}")
+        os.chmod(tmp, 0o600)
+        tmp.replace(out)
+    finally:
+        if was_running:
+            run(["docker", "start", container(a.name)], check=False, capture=True)
+    size = out.stat().st_size / 1024 / 1024
+    print(f"✓ بکاپ «{a.name}»: {out} ({size:.1f} MB)")
+    if was_running:
+        after_start(prof)
+
+
+def _safe_members(archive: Path) -> list[str]:
+    r = run(["tar", "-tzf", str(archive)], check=False, capture=True)
+    if r.returncode != 0:
+        die("فایل بکاپ خراب است یا tar.gz نیست")
+    names = [n for n in r.stdout.splitlines() if n]
+    for n in names:
+        parts = Path(n).parts
+        if n.startswith("/") or ".." in parts or parts[0] not in (BACKUP_MARK, "profile.json", "data"):
+            die(f"فایل بکاپ مسیر نامعتبر دارد: {n}")
+    if BACKUP_MARK not in names or "profile.json" not in names:
+        die("این فایل بکاپ android-farm نیست")
+    return names
+
+
+def cmd_restore(a):
+    archive = Path(a.file)
+    if not archive.is_file():
+        die(f"فایل «{a.file}» نیست")
+    _safe_members(archive)
+    stage_root = HOME / ".restore"
+    stage = stage_root / f"r{os.getpid()}"  # یک سطح پایین‌تر تا در all_profiles دیده نشود
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True)
+    try:
+        r = run(["tar", "-C", str(stage), "--numeric-owner", "--xattrs", "--xattrs-include=*",
+                 "-xzpf", str(archive)], check=False, capture=True)
+        if r.returncode != 0:
+            die(f"باز کردن بکاپ شکست خورد:\n{r.stderr}")
+        prof = json.loads((stage / "profile.json").read_text())
+        name = a.name or prof["name"]
+        if not NAME_RE.match(name):
+            die("نام نامعتبر")
+        if profile_path(name).exists() or (HOME / name).exists():
+            die(f"گوشی «{name}» از قبل هست؛ با نام دیگری بازگردانی کن (--name)")
+        twin = next((p["name"] for p in all_profiles()
+                     if p["identity"]["imei"] == prof["identity"]["imei"]), None)
+        if twin:
+            die(f"گوشی «{twin}» همین هویت را دارد؛ دو گوشی با یک هویت یعنی هویت جدا نیست "
+                f"(اول «{twin}» را حذف کن یا بکاپ را روی سرور دیگری بازگردانی کن)")
+        prof["name"] = name
+        prof["port"] = free_port()
+        img = prof.get("image") or default_image()
+        # سرور تازه ممکن است ایمیج دیگری ساخته باشد؛ داده‌ی /data با همان نسخه‌ی اندروید سازگار است
+        if run(["docker", "image", "inspect", img], check=False, capture=True).returncode != 0:
+            print(f"! ایمیج بکاپ ({img}) اینجا نیست؛ از {default_image()} استفاده می‌شود")
+            img = default_image()
+        prof["image"] = img
+        prof["restored"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        # هویت ذخیره‌شده هم برگردد، مگر روی این سرور همان نام مال هویت دیگری باشد
+        pname = prof.get("from_profile")
+        if pname:
+            ip = ident_path(pname)
+            owner = next((p["name"] for p in all_profiles() if p.get("from_profile") == pname), None)
+            if not ip.exists():
+                ident_dir().mkdir(parents=True, exist_ok=True)
+                os.chmod(ident_dir(), 0o700)
+                ip.write_text(json.dumps(prof["identity"], indent=2, ensure_ascii=False))
+                os.chmod(ip, 0o600)
+                print(f"+ پروفایل «{pname}» هم برگشت")
+            elif owner or json.loads(ip.read_text()).get("imei") != prof["identity"]["imei"]:
+                print(f"! پروفایل «{pname}» اینجا هویت یا گوشی دیگری دارد؛ گوشی بدون پیوند پروفایل برگشت")
+                prof["from_profile"] = None
+        (stage / BACKUP_MARK).unlink(missing_ok=True)
+        (stage / "data").mkdir(exist_ok=True)
+        stage.replace(HOME / name)
+        save(prof)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    i = prof["identity"]
+    print(f"+ {name}: {i['manufacturer']} {i['model']} | IMEI {i['imei']} (از بکاپ)")
+    try:
+        docker_run(prof)
+    except subprocess.CalledProcessError as e:
+        die(f"docker run شکست خورد (داده‌ها در {HOME / name} ماند):\n{e.stderr}")
+    after_start(prof)
+
+
 def cmd_models(_a):
     print("\n".join(identity.list_models()))
 
@@ -432,6 +547,12 @@ def main():
     pr.add_argument("pname", nargs="?")
     pr.add_argument("--model")
     pr.add_argument("--count", type=int, default=1)
+    b = sub.add_parser("backup", help="بکاپ کامل هویت و داده‌ها در یک فایل tar.gz")
+    b.add_argument("name")
+    b.add_argument("-o", "--output", help="مسیر فایل (پیش‌فرض: .backups/<name>-<time>.tar.gz)")
+    rs = sub.add_parser("restore", help="بازگردانی گوشی از فایل بکاپ")
+    rs.add_argument("file")
+    rs.add_argument("--name", help="نام تازه (پیش‌فرض: نام داخل بکاپ)")
     sub.add_parser("models")
     sub.add_parser("reconnect")
     a = ap.parse_args()
