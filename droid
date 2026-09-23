@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""droid — مدیریت دستگاه‌های اندروید مجازی (Redroid) با هویت جدا.
+
+  droid new <name> [--model M | --profile P] [--proxy host:port] [--mem 2g] [--cpus 1.5]
+  droid profile new [P] [--model M] [--count N] | list | show <P> | rm <P>
+  droid list | info <name> | start <name> | stop <name> | rm <name> [--purge]
+  droid shell <name> | view <name> | proxy <name> <host:port|off>
+  droid gsf <name> | models | reconnect
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+sys.path.insert(0, str(HERE / "lib"))
+import identity  # noqa: E402
+
+HOME = Path(os.environ.get("ANDROID_FARM_HOME", "/var/lib/android-farm"))
+CONF = Path(os.environ.get("ANDROID_FARM_CONF", "/etc/android-farm"))
+BASE_PORT = 6000  # بیرون از بازه‌ی 5555-5585 که adb خودش شبیه‌ساز فرض می‌کند
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+
+
+def default_image() -> str:
+    # install.sh ایمیج ساخته‌شده (با یا بدون Google Play) را اینجا می‌نویسد
+    if os.environ.get("ANDROID_FARM_IMAGE"):
+        return os.environ["ANDROID_FARM_IMAGE"]
+    f = CONF / "image"
+    return f.read_text().strip() if f.exists() else "redroid/redroid:13.0.0-latest"
+
+
+def die(msg: str, code: int = 1):
+    print(f"✗ {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, check=True, capture=False, timeout=None):
+    return subprocess.run(cmd, check=check, text=True, timeout=timeout,
+                          capture_output=capture)
+
+
+def container(name: str) -> str:
+    return f"droid-{name}"
+
+
+def profile_path(name: str) -> Path:
+    return HOME / name / "profile.json"
+
+
+def load(name: str) -> dict:
+    p = profile_path(name)
+    if not p.exists():
+        die(f"دستگاه «{name}» وجود ندارد (droid list)")
+    return json.loads(p.read_text())
+
+
+def save(prof: dict):
+    p = profile_path(prof["name"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(prof, indent=2, ensure_ascii=False))
+    os.chmod(tmp, 0o600)
+    tmp.replace(p)
+
+
+# پروفایل‌های هویت ذخیره‌شده، جدا از دستگاه‌ها (نقطه‌ی اول نام با نام دستگاه تداخل ندارد)
+def ident_dir() -> Path:
+    return HOME / ".identities"
+
+
+def ident_path(name: str) -> Path:
+    return ident_dir() / f"{name}.json"
+
+
+def saved_identities() -> list[tuple[str, dict]]:
+    d = ident_dir()
+    if not d.exists():
+        return []
+    return [(p.stem, json.loads(p.read_text())) for p in sorted(d.glob("*.json"))]
+
+
+def all_profiles() -> list[dict]:
+    if not HOME.exists():
+        return []
+    return [json.loads(p.read_text()) for p in sorted(HOME.glob("*/profile.json"))]
+
+
+def status(name: str) -> str:
+    r = run(["docker", "inspect", "-f", "{{.State.Status}}", container(name)],
+            check=False, capture=True)
+    return r.stdout.strip() if r.returncode == 0 else "missing"
+
+
+def serial(prof: dict) -> str:
+    return f"127.0.0.1:{prof['port']}"
+
+
+def adb(prof: dict, *args, capture=True, check=False, timeout=30):
+    return run(["adb", "-s", serial(prof), *args], capture=capture, check=check,
+               timeout=timeout)
+
+
+def wait_boot(prof: dict, timeout: int = 300) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        run(["adb", "connect", serial(prof)], check=False, capture=True, timeout=15)
+        try:
+            r = adb(prof, "shell", "getprop", "sys.boot_completed", timeout=10)
+            if r.stdout.strip() == "1":
+                return True
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(3)
+    return False
+
+
+def apply_proxy(prof: dict):
+    if prof.get("proxy"):
+        adb(prof, "shell", "settings", "put", "global", "http_proxy", prof["proxy"], check=True)
+    else:
+        adb(prof, "shell", "settings", "delete", "global", "http_proxy", check=True)
+
+
+# برای کار راحت با لمس از راه وب: صفحه هیچ‌وقت خاموش نشود، قفل صفحه نباشد،
+# انیمیشن‌ها کوتاه باشند و چرخش خودکار صفحه را به‌هم نریزد
+UX_COMMANDS = [
+    ["svc", "power", "stayon", "true"],
+    ["settings", "put", "system", "screen_off_timeout", "2147483647"],
+    ["locksettings", "set-disabled", "true"],
+    ["settings", "put", "global", "window_animation_scale", "0.5"],
+    ["settings", "put", "global", "transition_animation_scale", "0.5"],
+    ["settings", "put", "global", "animator_duration_scale", "0.5"],
+    ["settings", "put", "system", "accelerometer_rotation", "0"],
+    ["settings", "put", "secure", "show_ime_with_hard_keyboard", "1"],
+    ["input", "keyevent", "KEYCODE_WAKEUP"],
+    ["wm", "dismiss-keyguard"],
+]
+
+
+def apply_ux(prof: dict):
+    for c in UX_COMMANDS:
+        adb(prof, "shell", *c)
+
+
+def docker_run(prof: dict):
+    ident = prof["identity"]
+    data = HOME / prof["name"] / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    prop = HOME / prof["name"] / "identity.prop"
+    prop.write_text(identity.build_prop(ident))
+    prop.chmod(0o644)
+    cmd = [
+        "docker", "run", "-d", "--name", container(prof["name"]),
+        "--privileged", "--restart", "unless-stopped",
+        "--memory", prof["mem"], "--cpus", str(prof["cpus"]),
+        "--mac-address", ident["mac"], "--hostname", ident["device"],
+        "-p", f"127.0.0.1:{prof['port']}:5555",
+        "-v", f"{data}:/data",
+        "-v", f"{prop}:{identity.PROP_MOUNT}:ro",
+        "--label", "android-farm=1",
+        prof["image"], *identity.boot_args(ident),
+    ]
+    run(cmd, capture=True)
+
+
+def after_start(prof: dict):
+    print("… در حال بوت (بار اول ممکن است ۱ تا ۳ دقیقه طول بکشد)")
+    if not wait_boot(prof):
+        die(f"دستگاه بوت نشد؛ لاگ: docker logs {container(prof['name'])}")
+    apply_ux(prof)
+    if prof.get("proxy"):
+        apply_proxy(prof)
+    print(f"✓ «{prof['name']}» آماده است — adb: {serial(prof)}")
+
+
+def free_port() -> int:
+    used = {p["port"] for p in all_profiles()}
+    port = BASE_PORT
+    while port in used:
+        port += 1
+    return port
+
+
+def cmd_new(a):
+    if not NAME_RE.match(a.name):
+        die("نام فقط حروف کوچک انگلیسی، عدد و خط تیره (حداکثر ۳۱ کاراکتر)")
+    if profile_path(a.name).exists():
+        die(f"«{a.name}» از قبل وجود دارد")
+    if a.profile:
+        if a.model:
+            die("--model و --profile با هم نمی‌شوند؛ مدل داخل پروفایل است")
+        if not ident_path(a.profile).exists():
+            die(f"پروفایل «{a.profile}» نیست (droid profile list)")
+        owner = next((p["name"] for p in all_profiles() if p.get("from_profile") == a.profile), None)
+        if owner:
+            die(f"پروفایل «{a.profile}» را دستگاه «{owner}» استفاده می‌کند؛ دو دستگاه با یک هویت یعنی هویت جدا نیست")
+        ident = json.loads(ident_path(a.profile).read_text())
+    else:
+        try:
+            ident = identity.gen_identity(a.model)
+        except ValueError:
+            die("مدل ناشناخته؛ لیست: droid models")
+    prof = {
+        "name": a.name, "port": free_port(), "image": a.image or default_image(),
+        "mem": a.mem, "cpus": a.cpus, "proxy": a.proxy,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"), "identity": ident,
+        "from_profile": a.profile,
+    }
+    save(prof)
+    try:
+        docker_run(prof)
+    except subprocess.CalledProcessError as e:
+        shutil.rmtree(HOME / a.name, ignore_errors=True)
+        die(f"docker run شکست خورد:\n{e.stderr}")
+    print(f"+ {a.name}: {ident['manufacturer']} {ident['model']} | IMEI {ident['imei']}")
+    after_start(prof)
+
+
+def cmd_list(_a):
+    profs = all_profiles()
+    if not profs:
+        print("هیچ دستگاهی نیست — droid new <name>")
+        return
+    print(f"{'NAME':<16}{'STATUS':<10}{'ADB':<17}{'MODEL':<22}{'IMEI':<17}PROXY")
+    for p in profs:
+        i = p["identity"]
+        print(f"{p['name']:<16}{status(p['name']):<10}{serial(p):<17}"
+              f"{i['manufacturer'] + ' ' + i['model']:<22}{i['imei']:<17}{p.get('proxy') or '-'}")
+
+
+def cmd_info(a):
+    prof = load(a.name)
+    print(json.dumps(prof, indent=2, ensure_ascii=False))
+    if status(a.name) == "running":
+        run(["adb", "connect", serial(prof)], check=False, capture=True, timeout=15)
+        live = {}
+        for key in ("ro.product.model", "ro.product.brand", "ro.serialno",
+                    "ro.build.version.release"):
+            live[key] = adb(prof, "shell", "getprop", key).stdout.strip()
+        aid = adb(prof, "shell", "settings", "get", "secure", "android_id").stdout.strip()
+        live["android_id"] = aid
+        print("\nمقادیر زنده داخل دستگاه:")
+        for k, v in live.items():
+            print(f"  {k:<28}{v}")
+
+
+def cmd_start(a):
+    prof = load(a.name)
+    st = status(a.name)
+    if st == "running":
+        print("از قبل روشن است")
+        return
+    if st == "missing":
+        docker_run(prof)
+    else:
+        run(["docker", "start", container(a.name)], capture=True)
+    after_start(prof)
+
+
+def cmd_stop(a):
+    prof = load(a.name)
+    run(["adb", "disconnect", serial(prof)], check=False, capture=True)
+    run(["docker", "stop", "-t", "20", container(a.name)], check=False, capture=True)
+    print(f"■ «{a.name}» خاموش شد")
+
+
+def cmd_rm(a):
+    prof = load(a.name)
+    run(["adb", "disconnect", serial(prof)], check=False, capture=True)
+    run(["docker", "rm", "-f", container(a.name)], check=False, capture=True)
+    if a.purge:
+        if not a.yes:
+            ans = input(f"همه‌ی داده‌ها و اکانت‌های «{a.name}» پاک شود؟ (yes/no) ")
+            if ans.strip().lower() != "yes":
+                die("لغو شد", 0)
+        shutil.rmtree(HOME / a.name)
+        print(f"✓ «{a.name}» کامل پاک شد")
+    else:
+        print(f"✓ کانتینر حذف شد؛ داده‌ها در {HOME / a.name} ماند (droid start {a.name} برمی‌گرداند)")
+
+
+def cmd_shell(a):
+    prof = load(a.name)
+    run(["adb", "connect", serial(prof)], check=False, capture=True, timeout=15)
+    os.execvp("adb", ["adb", "-s", serial(prof), "shell"])
+
+
+def cmd_view(a):
+    prof = load(a.name)
+    web = ""
+    cfg = CONF / "web-url"
+    if cfg.exists():
+        web = cfg.read_text().strip()
+    if web:
+        print(f"وب: {web}  ← دستگاه {serial(prof)} را از لیست انتخاب کن")
+    print("روی کامپیوتر خودت (با scrcpy نصب‌شده):")
+    print(f"  ssh -N -L {prof['port']}:127.0.0.1:{prof['port']} root@<server-ip> &")
+    print(f"  adb connect 127.0.0.1:{prof['port']} && scrcpy -s 127.0.0.1:{prof['port']}")
+
+
+def cmd_proxy(a):
+    prof = load(a.name)
+    prof["proxy"] = None if a.value == "off" else a.value
+    if prof["proxy"] and not re.match(r"^[\w.\-]+:\d{1,5}$", prof["proxy"]):
+        die("فرمت پروکسی: host:port")
+    save(prof)
+    if status(a.name) == "running":
+        run(["adb", "connect", serial(prof)], check=False, capture=True, timeout=15)
+        apply_proxy(prof)
+    print(f"✓ پروکسی «{a.name}»: {prof['proxy'] or 'خاموش'}")
+
+
+GSF_DB = "/data/data/com.google.android.gsf/databases/gservices.db"
+
+
+def cmd_gsf(a):
+    prof = load(a.name)
+    if status(a.name) != "running":
+        die(f"«{a.name}» روشن نیست (droid start {a.name})")
+    run(["adb", "connect", serial(prof)], check=False, capture=True, timeout=15)
+    if "vending" not in adb(prof, "shell", "pm", "list", "packages", "com.android.vending").stdout:
+        die("این دستگاه Google Play ندارد (ایمیج بدون GApps)")
+    # دیتابیس GSF فقط با روت خواندنی است؛ adbd در redroid روت می‌شود
+    adb(prof, "root", timeout=15)
+    time.sleep(2)
+    wait_boot(prof, timeout=30)
+    # adb shell آرگومان‌ها را با فاصله به هم می‌چسباند؛ پس کوئری باید یک رشته‌ی نقل‌قول‌شده باشد
+    gsf = adb(prof, "shell", f"sqlite3 {GSF_DB} \"select value from main where name='android_id'\"").stdout.strip()
+    if not gsf.isdigit():
+        die("شناسه‌ی GSF هنوز ساخته نشده؛ یک بار Play Store را باز کن و دوباره امتحان کن")
+    print(f"GSF ID: {gsf}")
+    print("اگر Play Store گفت «دستگاه تأییدنشده»، این عدد را با همان اکانت گوگل در")
+    print("  https://www.google.com/android/uncertified")
+    print(f"ثبت کن، چند دقیقه صبر کن و بعد: droid stop {a.name} && droid start {a.name}")
+
+
+def cmd_profile(a):
+    act = a.action
+    if act == "new":
+        names = []
+        if a.pname:
+            if not NAME_RE.match(a.pname):
+                die("نام پروفایل فقط حروف کوچک انگلیسی، عدد و خط تیره")
+            if a.count != 1:
+                die("با --count نام نده؛ نام‌ها خودکار p1، p2، … می‌شوند")
+            if ident_path(a.pname).exists():
+                die(f"پروفایل «{a.pname}» از قبل هست")
+            names = [a.pname]
+        else:
+            i = 1
+            while len(names) < a.count:
+                if not ident_path(f"p{i}").exists():
+                    names.append(f"p{i}")
+                i += 1
+        ident_dir().mkdir(parents=True, exist_ok=True)
+        os.chmod(ident_dir(), 0o700)
+        for n in names:
+            try:
+                ident = identity.gen_identity(a.model)
+            except ValueError:
+                die("مدل ناشناخته؛ لیست: droid models")
+            ident["created"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            f = ident_path(n)
+            f.write_text(json.dumps(ident, indent=2, ensure_ascii=False))
+            os.chmod(f, 0o600)
+            print(f"+ {n}: {ident['manufacturer']} {ident['model']} | IMEI {ident['imei']} | S/N {ident['serial']}")
+        print(f"استفاده: droid new <name> --profile {names[0]}")
+    elif act == "list":
+        items = saved_identities()
+        if not items:
+            print("هیچ پروفایلی ذخیره نشده — droid profile new")
+            return
+        used = {p.get("from_profile"): p["name"] for p in all_profiles() if p.get("from_profile")}
+        print(f"{'PROFILE':<14}{'MODEL':<24}{'IMEI':<17}{'SERIAL':<13}DEVICE")
+        for n, i in items:
+            print(f"{n:<14}{i['manufacturer'] + ' ' + i['model']:<24}{i['imei']:<17}"
+                  f"{i['serial']:<13}{used.get(n, '-')}")
+    else:
+        if not a.pname or not ident_path(a.pname).exists():
+            die(f"پروفایل «{a.pname}» نیست (droid profile list)")
+        if act == "show":
+            print(ident_path(a.pname).read_text())
+        else:  # rm
+            owner = next((p["name"] for p in all_profiles() if p.get("from_profile") == a.pname), None)
+            if owner:
+                die(f"دستگاه «{owner}» از این پروفایل ساخته شده؛ اول آن را پاک کن")
+            ident_path(a.pname).unlink()
+            print(f"✓ پروفایل «{a.pname}» پاک شد")
+
+
+def cmd_models(_a):
+    print("\n".join(identity.list_models()))
+
+
+def cmd_reconnect(_a):
+    for p in all_profiles():
+        if status(p["name"]) == "running":
+            r = run(["adb", "connect", serial(p)], check=False, capture=True, timeout=15)
+            print(f"{p['name']}: {r.stdout.strip()}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="droid", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    n = sub.add_parser("new")
+    n.add_argument("name")
+    n.add_argument("--model")
+    n.add_argument("--proxy")
+    n.add_argument("--mem", default="2g")
+    n.add_argument("--cpus", default="1.5")
+    n.add_argument("--image")
+    n.add_argument("--profile", help="هویت ذخیره‌شده (droid profile list)")
+    sub.add_parser("list")
+    for c in ("info", "start", "stop", "shell", "view", "gsf"):
+        sub.add_parser(c).add_argument("name")
+    r = sub.add_parser("rm")
+    r.add_argument("name")
+    r.add_argument("--purge", action="store_true", help="داده‌ها را هم پاک کن")
+    r.add_argument("-y", "--yes", action="store_true")
+    p = sub.add_parser("proxy")
+    p.add_argument("name")
+    p.add_argument("value", help="host:port یا off")
+    pr = sub.add_parser("profile", help="ساخت و نگه‌داری پروفایل‌های هویت")
+    pr.add_argument("action", choices=["new", "list", "show", "rm"])
+    pr.add_argument("pname", nargs="?")
+    pr.add_argument("--model")
+    pr.add_argument("--count", type=int, default=1)
+    sub.add_parser("models")
+    sub.add_parser("reconnect")
+    a = ap.parse_args()
+
+    if a.cmd == "profile" and not 1 <= a.count <= 100:
+        die("--count بین ۱ و ۱۰۰")
+    if a.cmd not in ("models", "profile"):
+        for tool in ("docker", "adb"):
+            if not shutil.which(tool):
+                die(f"{tool} نصب نیست — اول install.sh را اجرا کن")
+    if a.cmd == "new" and a.proxy and not re.match(r"^[\w.\-]+:\d{1,5}$", a.proxy):
+        die("فرمت پروکسی: host:port")
+    globals()["cmd_" + a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
