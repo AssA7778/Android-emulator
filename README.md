@@ -15,6 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/AssA7778/Android-emulator/main/boot
 - فقط بررسی سرور، بدون نصب: `... | sudo bash -s -- --check`
 - بدون پنل وب: `... | sudo bash -s -- --no-web`
 - بدون Google Play (اندروید ۱۳ خام): `... | sudo bash -s -- --no-gapps`
+- Google Play بدون Gmail پیش‌نصب: `... | sudo bash -s -- --no-gmail`
 
 در پایان، آدرس پنل وب و رمز در `/etc/android-farm/web-credentials` ذخیره می‌شود.
 
@@ -65,6 +66,7 @@ droid restore acc1-20260923-101500.tar.gz --name acc7   # با نام تازه
 ## Google Play و اپ‌ها
 
 - پیش‌فرض نصب، اندروید ۱۲ با **Google Play** (MindTheGapps) و **libndk** است تا اپ‌هایی که فقط نسخه‌ی ARM دارند (بیشتر اپ‌های فروشگاه) روی سرور x86 اجرا شوند. نسخه‌ی ۱۲ انتخاب شده چون libndk روی ۱۳ کار نمی‌کند.
+- **Gmail از پیش نصب است** (اپ سیستمی داخل ایمیج). نسخه‌ی x86_64 از APKPure گرفته می‌شود و فقط اگر با گواهی خود گوگل امضا شده باشد استفاده می‌شود؛ اگر دانلود یا بررسی شکست بخورد، نصب بدون Gmail ادامه پیدا می‌کند. برای حذفش: `--no-gmail`.
 - ایمیج هنگام نصب با [redroid-script](https://github.com/ayasa520/redroid-script) (نسخه‌ی قفل‌شده و تست‌شده) ساخته می‌شود؛ ۳ تا ۱۰ دقیقه و حدود ۴ گیگ فضا.
 - Play Store را باز کن و با اکانت گوگل وارد شو. اگر گفت «دستگاه تأییدنشده» (Device is not Play Protect certified):
   ```bash

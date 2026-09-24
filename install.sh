@@ -5,6 +5,7 @@
 #   sudo bash install.sh --domain d.com  پنل وب با HTTPS روی دامنه
 #   sudo bash install.sh --no-web        بدون پنل وب و نمایشگر صفحه
 #   sudo bash install.sh --no-gapps      اندروید ۱۳ خام، بدون Google Play
+#   sudo bash install.sh --no-gmail      Google Play بدون Gmail پیش‌نصب
 set -euo pipefail
 
 APP_DIR=/opt/android-farm
@@ -16,6 +17,12 @@ IMAGE=redroid/redroid:13.0.0-latest
 GAPPS_IMAGE=redroid/redroid:12.0.0_mindthegapps_ndk
 REDROID_SCRIPT_REF=a4951b7  # ayasa520/redroid-script 2026-09-13 — تست‌شده
 GAPPS=1
+# Gmail از پیش نصب (اپ سیستمی داخل ایمیج)؛ نسخه‌ی تک‌فایل x86_64 از APKPure با apkeep،
+# و فقط اگر با گواهی خود گوگل امضا شده باشد.
+GMAIL=1
+GMAIL_IMAGE=android-farm/redroid:12-gapps-gmail
+APKEEP_VER=1.0.0
+GOOGLE_CERT=f0fd6c5b410f25cb25c3b53346c8972fae30f8ee7411df910480ad6b2d60db83
 WS_SCRCPY_REF=8855ad11  # master 2026-08-24: fitToScreen (تصویر کامل در صفحه‌ی موبایل) — تست‌شده
 MODE=install
 DOMAIN=""
@@ -27,7 +34,8 @@ while [[ $# -gt 0 ]]; do
     --domain) DOMAIN="${2:?}"; shift ;;
     --no-web) WEB=0 ;;
     --no-gapps) GAPPS=0 ;;
-    -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+    --no-gmail) GMAIL=0 ;;
+    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
     *) echo "گزینه‌ی ناشناخته: $1" >&2; exit 1 ;;
   esac
   shift
@@ -134,6 +142,7 @@ install_app() {
   install -m 755 "$SRC_DIR/droid" "$APP_DIR/droid"
   install -m 644 "$SRC_DIR/lib/identity.py" "$APP_DIR/lib/identity.py"
   install -m 644 "$SRC_DIR/lib/panel.py" "$APP_DIR/lib/panel.py"
+  install -m 644 "$SRC_DIR/lib/apkcert.py" "$APP_DIR/lib/apkcert.py"
   install -D -m 644 "$SRC_DIR/web/index.html" "$APP_DIR/web/index.html"
   ln -sf "$APP_DIR/droid" /usr/local/bin/droid
 
@@ -155,7 +164,10 @@ EOF
   systemctl enable android-farm-reconnect.service >/dev/null
   ok "droid در /usr/local/bin نصب شد"
 
-  if (( GAPPS )); then build_gapps_image; else
+  if (( GAPPS )); then
+    build_gapps_image
+    if (( GMAIL )); then add_gmail; fi
+  else
     step "دانلود ایمیج اندروید ($IMAGE)"
     docker pull -q "$IMAGE" >/dev/null
     ok "ایمیج آماده است"
@@ -180,6 +192,51 @@ build_gapps_image() {
     || { bad "ساخت ایمیج شکست خورد — لاگ: /tmp/android-farm-gapps.log (بدون Play: --no-gapps)"; exit 1; }
   docker image prune -f >/dev/null
   ok "ایمیج با Google Play و پشتیبانی ARM آماده است"
+}
+
+add_gmail() {
+  step "افزودن Gmail به ایمیج ($GMAIL_IMAGE)"
+  if docker image inspect "$GMAIL_IMAGE" >/dev/null 2>&1; then
+    ok "ایمیج با Gmail از قبل ساخته شده"; IMAGE=$GMAIL_IMAGE; return
+  fi
+  apt-get install -y -qq unzip >/dev/null
+  local work apk app
+  work=$(mktemp -d)
+  # شکست در این مرحله نصب را متوقف نمی‌کند؛ فقط گوشی‌ها بدون Gmail ساخته می‌شوند
+  if ! curl -fsSL --retry 5 --retry-all-errors -o "$work/apkeep" \
+      "https://github.com/EFForg/apkeep/releases/download/$APKEEP_VER/apkeep-x86_64-unknown-linux-gnu"; then
+    warn "دانلود apkeep شکست خورد — ادامه بدون Gmail"; rm -rf "$work"; return
+  fi
+  chmod +x "$work/apkeep"
+  echo "  • دانلود Gmail (~۲۰۰MB)…"
+  local _
+  for _ in 1 2 3; do
+    "$work/apkeep" -a com.google.android.gm -d apk-pure -o arch=x86_64 "$work" >/dev/null 2>&1 || true
+    apk=$(find "$work" -maxdepth 1 -name 'com.google.android.gm*.apk' | head -1)
+    [[ -n $apk ]] && unzip -tqq "$apk" >/dev/null 2>&1 && break
+    rm -f "$work"/com.google.android.gm*; apk=""; sleep 5
+  done
+  if [[ -z $apk ]]; then
+    warn "Gmail تک‌فایل x86_64 پیدا نشد — ادامه بدون Gmail (بعداً از Play نصبش کن)"; rm -rf "$work"; return
+  fi
+  if ! python3 "$APP_DIR/lib/apkcert.py" "$apk" "$GOOGLE_CERT"; then
+    bad "امضای فایل Gmail مال گوگل نیست — کنار گذاشته شد"; rm -rf "$work"; return
+  fi
+  # اپ سیستمی: کتابخانه‌های native فشرده‌اند، پس باید کنار APK باز شوند
+  app=$work/ctx/Gmail2
+  mkdir -p "$app/lib/x86_64"
+  cp "$apk" "$app/Gmail2.apk"
+  if ! unzip -j -q "$apk" 'lib/x86_64/*' -d "$app/lib/x86_64"; then
+    warn "کتابخانه‌ی x86_64 داخل Gmail نبود — ادامه بدون Gmail"; rm -rf "$work"; return
+  fi
+  find "$app" -type d -exec chmod 755 {} + && find "$app" -type f -exec chmod 644 {} +
+  printf 'FROM %s\nCOPY Gmail2 /system/app/Gmail2\n' "$IMAGE" > "$work/ctx/Dockerfile"
+  if docker build -q -t "$GMAIL_IMAGE" "$work/ctx" >/dev/null; then
+    IMAGE=$GMAIL_IMAGE; ok "Gmail روی همه‌ی گوشی‌های جدید از پیش نصب است"
+  else
+    warn "ساخت ایمیج Gmail شکست خورد — ادامه بدون Gmail"
+  fi
+  rm -rf "$work"
 }
 
 install_web() {
